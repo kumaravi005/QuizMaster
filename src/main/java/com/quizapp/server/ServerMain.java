@@ -1,0 +1,151 @@
+package com.quizapp.server;
+
+import com.quizapp.dto.ErrorResponse;
+import com.quizapp.exception.QuizAppException;
+import com.quizapp.model.User;
+import com.quizapp.server.dao.AttemptDAO;
+import com.quizapp.server.dao.QuestionDAO;
+import com.quizapp.server.dao.QuizDAO;
+import com.quizapp.server.dao.UserDAO;
+import com.quizapp.server.service.AuthService;
+import com.quizapp.server.service.AttemptService;
+import com.quizapp.server.service.LiveService;
+import com.quizapp.server.service.QuizService;
+import com.quizapp.server.web.AdminController;
+import com.quizapp.server.web.LiveController;
+import com.quizapp.server.web.LiveHub;
+import com.quizapp.server.web.StudentController;
+import java.time.Clock;
+import com.quizapp.server.web.Auth;
+import com.quizapp.server.web.AuthController;
+import io.javalin.Javalin;
+import io.javalin.http.HttpResponseException;
+import io.javalin.http.staticfiles.Location;
+import java.util.Map;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/** Entry point of the server program: java -jar quizmaster-server.jar */
+public class ServerMain {
+
+    private static final Logger LOG = LoggerFactory.getLogger(ServerMain.class);
+
+    public static void main(String[] args) throws Exception {
+        Config config = Config.fromEnvironment();
+        createApp(config).start(config.getPort());
+        LOG.info("QuizMaster server running on port {} ({} mode)", config.getPort(), config.isDev() ? "dev" : "prod");
+        // Addresses other devices on the same Wi-Fi can use (for the demo)
+        for (String ip : lanAddresses()) {
+            LOG.info("On this network: app -Dserver.url=http://{}:{}   live page: http://{}:{}/live.html",
+                    ip, config.getPort(), ip, config.getPort());
+        }
+    }
+
+    private static java.util.List<String> lanAddresses() {
+        java.util.List<String> result = new java.util.ArrayList<>();
+        try {
+            for (java.net.NetworkInterface nic : java.util.Collections.list(java.net.NetworkInterface.getNetworkInterfaces())) {
+                if (!nic.isUp() || nic.isLoopback() || nic.isVirtual()) {
+                    continue;
+                }
+                for (java.net.InetAddress a : java.util.Collections.list(nic.getInetAddresses())) {
+                    if (a instanceof java.net.Inet4Address && a.isSiteLocalAddress()) {
+                        result.add(a.getHostAddress());
+                    }
+                }
+            }
+        } catch (java.net.SocketException ignored) {
+            // no network information available
+        }
+        return result;
+    }
+
+    /** Builds the whole server (separate from main so tests can start it too). */
+    public static Javalin createApp(Config config) throws Exception {
+        // Database
+        DatabaseManager db = new DatabaseManager(config.getDbPath());
+        db.createTables();
+
+        // DAOs -> services -> controllers
+        UserDAO userDAO = new UserDAO(db);
+        AuthService authService = new AuthService(userDAO, new SessionStore());
+        QuizDAO quizDAO = new QuizDAO(db);
+        QuestionDAO questionDAO = new QuestionDAO(db);
+        QuizService quizService = new QuizService(quizDAO, questionDAO);
+        AttemptDAO attemptDAO = new AttemptDAO(db);
+        AttemptService attemptService = new AttemptService(quizDAO, questionDAO, attemptDAO, Clock.systemUTC());
+        LiveService liveService = new LiveService(quizDAO, attemptDAO, Clock.systemUTC());
+        LiveHub liveHub = new LiveHub(liveService);
+        attemptService.setChangeListener(liveHub::publish); // every change is pushed to live viewers
+
+        if (authService.ensureAdminExists(config.getAdminUsername(), config.getAdminPassword())) {
+            LOG.info("Created admin account '{}'", config.getAdminUsername());
+        }
+        if (config.isDev()) {
+            int adminId = userDAO.findByUsername(config.getAdminUsername()).map(User::getId).orElse(1);
+            quizService.addSampleQuizIfEmpty(adminId);
+        }
+
+        AuthController authController = new AuthController(authService);
+        AdminController adminController = new AdminController(quizService);
+        StudentController studentController = new StudentController(attemptService);
+        LiveController liveController = new LiveController(liveService);
+
+        Javalin app = Javalin.create(javalin -> {
+            javalin.staticFiles.add("/public", Location.CLASSPATH); // index.html, live.html
+            javalin.showJavalinBanner = false;
+        });
+
+        // Every /api request (except public ones) must carry a valid token
+        app.before("/api/*", Auth.filter(authService));
+        // ...and /api/admin requests must come from an admin
+        app.before("/api/admin/*", Auth::requireAdmin);
+
+        // Routes
+        app.get("/health", ctx -> ctx.json(Map.of("status", "UP")));
+        app.post("/api/auth/register", authController::register);
+        app.post("/api/auth/login", authController::login);
+        app.post("/api/auth/logout", authController::logout);
+        app.get("/api/auth/me", authController::me);
+
+        app.get("/api/admin/quizzes", adminController::listQuizzes);
+        app.post("/api/admin/quizzes", adminController::createQuiz);
+        app.get("/api/admin/quizzes/{id}", adminController::getQuiz);
+        app.put("/api/admin/quizzes/{id}", adminController::updateQuiz);
+        app.delete("/api/admin/quizzes/{id}", adminController::deleteQuiz);
+        app.post("/api/admin/quizzes/{id}/publish", adminController::publish);
+        app.post("/api/admin/quizzes/{id}/unpublish", adminController::unpublish);
+        app.post("/api/admin/quizzes/{id}/questions", adminController::addQuestion);
+        app.put("/api/admin/questions/{qid}", adminController::updateQuestion);
+        app.delete("/api/admin/questions/{qid}", adminController::deleteQuestion);
+
+        app.get("/api/quizzes", studentController::availableQuizzes);
+        app.post("/api/quizzes/{id}/start", studentController::start);
+        app.put("/api/attempts/{id}/progress", studentController::progress);
+        app.post("/api/attempts/{id}/submit", studentController::submit);
+        app.get("/api/attempts/{id}/review", studentController::review);
+        app.get("/api/me/attempts", studentController::history);
+
+        app.get("/api/admin/quizzes/{id}/results", liveController::results);
+        app.get("/api/live", liveController::quizzes);
+        app.get("/api/live/{id}", liveController::state);
+        app.ws("/ws/live", liveHub::configure);
+
+        // Errors -> {"error": "..."} with the right status code.
+        // e.getHttpStatus() is resolved at runtime by the real exception class (dynamic method dispatch).
+        app.exception(QuizAppException.class, (e, ctx) -> {
+            if (e.getHttpStatus() >= 500) {
+                LOG.error("Server error on {} {}", ctx.method(), ctx.path(), e);
+            }
+            ctx.status(e.getHttpStatus()).json(new ErrorResponse(e.getMessage()));
+        });
+        app.exception(HttpResponseException.class, (e, ctx) ->
+                ctx.status(e.getStatus()).json(new ErrorResponse(e.getMessage())));
+        app.exception(Exception.class, (e, ctx) -> {
+            LOG.error("Unexpected error on {} {}", ctx.method(), ctx.path(), e);
+            ctx.status(500).json(new ErrorResponse("Something went wrong on the server"));
+        });
+
+        return app;
+    }
+}
