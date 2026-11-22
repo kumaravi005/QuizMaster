@@ -1,0 +1,35 @@
+# Build output
+target/
+
+# Local database and backups (created when the server runs)
+data/
+*.db
+*.db-shm
+*.db-wal
+
+# Local client settings
+config.properties
+
+# IDE / OS
+.idea/
+*.iml
+.vscode/
+.classpath
+.project
+.settings/
+out/
+.DS_Store
+Thumbs.db
+*.log
+
+# Personal files (syllabus, rubric, notes) — not part of the project
+reference/
+*.zip
+# Project report and presentation (kept private, not on GitHub)
+report/
+*.pptx
+*.docx
+main*.pdf
+*.pdf
+CLAUDE.md
+.claude/
